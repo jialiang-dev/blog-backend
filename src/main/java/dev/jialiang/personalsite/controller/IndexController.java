@@ -1,7 +1,5 @@
 package dev.jialiang.personalsite.controller;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.jialiang.personalsite.dto.ApiResponse;
 import org.springframework.web.bind.annotation.*;
 
@@ -19,16 +17,17 @@ import java.util.Map;
 @RequestMapping("/api/finance")
 public class IndexController {
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
-
     // 新浪财经实时行情 API（免费，无需 key）
     private static final String SINA_URL =
-        "http://hq.sinajs.cn/list=s_sh000001,s_sz399001,s_sh000300,s_sz399006," +
-        "int_dji,int_nasdaq,int_sp500,int_nikkei,rt_hkHSI,int_kospi";
+        "http://hq.sinajs.cn/list=s_sh000001,s_sz399006," +
+        "gb_inx,gb_ndx,rt_hkHSI";
 
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(8))
             .build();
+
+    // 缓存最近一次非零涨跌幅，避免休市时显示 0%
+    private final Map<String, Double> lastChangeCache = new java.util.concurrent.ConcurrentHashMap<>();
 
     @GetMapping("/indices")
     public ApiResponse<List<Map<String, Object>>> getIndices() {
@@ -39,10 +38,13 @@ public class IndexController {
                     .header("Referer", "https://finance.sina.com.cn")
                     .GET().build();
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            return ApiResponse.success(parseSinaResponse(resp.body()));
+            List<Map<String, Object>> result = parseSinaResponse(resp.body());
+            if (result.isEmpty()) {
+                return ApiResponse.error(502, "新浪 API 返回空数据");
+            }
+            return ApiResponse.success(result);
         } catch (Exception e) {
-            // 返回降级数据
-            return ApiResponse.success(fallbackData());
+            return ApiResponse.error(502, "无法连接新浪 API: " + e.getMessage());
         }
     }
 
@@ -51,8 +53,10 @@ public class IndexController {
         String[] lines = body.split("\n");
         for (String line : lines) {
             if (!line.contains("=")) continue;
-            // 判断是否为港股实时数据（rt_ 前缀），其字段位置与 A 股/国际指数不同
+            // 前缀决定字段格式:
+            //   rt_ = 港股实时, gb_ = 美股指数, s_/int_ = A股/国际指数
             boolean isHK = line.contains("hq_str_rt_");
+            boolean isUS = line.contains("hq_str_gb_");
             String data = line.substring(line.indexOf("\"") + 1, line.lastIndexOf("\""));
             String[] fields = data.split(",");
             if (fields.length < 4) continue;
@@ -63,9 +67,14 @@ public class IndexController {
 
             if (isHK) {
                 // 港股格式: 英文简称,中文名,当前价,昨收,最高,最低,开盘,涨跌额,涨跌幅%,...
-                name = fields[1];                    // 中文名称
-                price = parseDouble(fields[2]);      // 当前价
-                changePct = parseDouble(fields[8]);  // 涨跌幅%
+                name = fields[1];
+                price = parseDouble(fields[2]);
+                changePct = parseDouble(fields[8]);
+            } else if (isUS) {
+                // 美股指数格式: 名称,当前价,涨跌幅%,时间戳,涨跌额,...
+                name = fields[0];
+                price = parseDouble(fields[1]);
+                changePct = parseDouble(fields[2]);
             } else {
                 // A股/国际指数格式: 名称,当前价,涨跌额,涨跌幅%,...
                 name = fields[0];
@@ -74,12 +83,12 @@ public class IndexController {
             }
 
             Map<String, Object> item = new LinkedHashMap<>();
-            item.put("name", name);
+            item.put("name", normalizeName(name));
             item.put("price", Math.round(price * 100.0) / 100.0);
             item.put("change", Math.round(changePct * 100.0) / 100.0);
             result.add(item);
         }
-        return result.isEmpty() ? fallbackData() : result;
+        return result;
     }
 
     private double parseDouble(String s) {
@@ -87,67 +96,14 @@ public class IndexController {
         catch (Exception e) { return 0; }
     }
 
-    private List<Map<String, Object>> fallbackData() {
-        List<Map<String, Object>> list = new ArrayList<>();
-        String[][] fb = {
-            {"上证指数", "3258.36"}, {"深证成指", "10892.71"}, {"沪深300", "3891.54"},
-            {"创业板指", "2156.30"}, {"标普500", "5302.15"}, {"纳斯达克", "18972.45"},
-            {"道琼斯", "42081.33"}, {"日经225", "38710.52"}, {"恒生指数", "19463.87"},
-            {"韩国KOSPI", "2735.18"}
-        };
-        for (String[] f : fb) {
-            Map<String, Object> item = new LinkedHashMap<>();
-            item.put("name", f[0]);
-            item.put("price", Double.parseDouble(f[1]));
-            item.put("change", 0.0);
-            list.add(item);
-        }
-        return list;
-    }
-
-    /**
-     * 个股日K线数据（新浪财经 API）
-     * GET /api/finance/kline?code=sz002595&days=30
-     */
-    @GetMapping("/kline")
-    public ApiResponse<List<Map<String, Object>>> getKline(@RequestParam String code, @RequestParam(defaultValue = "30") int days) {
-        // 判断A股还是美股
-        String url;
-        if (code.startsWith("gb_")) {
-            // 美股用新浪日K接口
-            url = String.format("http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=%s&datalen=%d",
-                    code.replace("gb_", ""), days);
-        } else {
-            url = String.format("http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s&scale=240&ma=no&datalen=%d",
-                    code, days);
-        }
-        try {
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(10))
-                    .header("Referer", "https://finance.sina.com.cn")
-                    .GET().build();
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            return ApiResponse.success(parseKline(resp.body()));
-        } catch (Exception e) {
-            return ApiResponse.success(List.of());
-        }
-    }
-
-    private List<Map<String, Object>> parseKline(String body) {
-        List<Map<String, Object>> result = new ArrayList<>();
-        try {
-            JsonNode arr = objectMapper.readTree(body);
-            for (JsonNode node : arr) {
-                Map<String, Object> point = new LinkedHashMap<>();
-                point.put("date", node.get("day").asText());
-                point.put("close", parseDouble(node.get("close").asText()));
-                result.add(point);
-            }
-        } catch (Exception e) {
-            return result;
-        }
-        return result;
+    private String normalizeName(String raw) {
+        if (raw == null) return "";
+        return raw
+            .replace("标普500指数", "标普500")
+            .replace("纳斯达克100", "纳斯达克100")
+            .replace("恒生指数", "恒生指数")
+            .replace("上证指数", "上证指数")
+            .replace("创业板指", "创业板指");
     }
 
     /**
@@ -156,7 +112,6 @@ public class IndexController {
      */
     @GetMapping("/stock-quotes")
     public ApiResponse<List<Map<String, Object>>> getStockQuotes(@RequestParam String codes) {
-        String sinaCodes = codes.replace("gb_", "gb_"); // 美股前缀保持不变
         String url = "http://hq.sinajs.cn/list=" + codes;
         try {
             HttpRequest req = HttpRequest.newBuilder()
@@ -167,7 +122,7 @@ public class IndexController {
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
             return ApiResponse.success(parseStockQuotes(resp.body()));
         } catch (Exception e) {
-            return ApiResponse.success(List.of());
+            return ApiResponse.error(502, "无法连接新浪 API");
         }
     }
 
@@ -185,15 +140,21 @@ public class IndexController {
             double price, prevClose, changePct;
 
             if (codePart.startsWith("gb_")) {
-                // 美股: fields[1]=当前价, fields[26]=昨收
+                // 美股: fields[1]=当前价(盘中)/昨收(休市), fields[2]=涨跌幅%
                 price = parseDouble(fields[1]);
-                prevClose = fields.length > 26 ? parseDouble(fields[26]) : price;
-                changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
+                changePct = parseDouble(fields[2]);
             } else {
-                // A 股: fields[1]=开盘, fields[2]=昨收, fields[3]=当前价
+                // A 股: fields[1]=开盘, fields[2]=昨收, fields[3]=当前价, fields[32]=涨跌幅%
                 price = parseDouble(fields[3]);
                 prevClose = parseDouble(fields[2]);
                 changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
+            }
+
+            // 休市时涨跌幅为 0，用缓存的上次非零值替代
+            if (changePct == 0.0 && lastChangeCache.containsKey(codePart)) {
+                changePct = lastChangeCache.get(codePart);
+            } else if (changePct != 0.0) {
+                lastChangeCache.put(codePart, changePct);
             }
 
             Map<String, Object> item = new LinkedHashMap<>();
