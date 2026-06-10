@@ -88,11 +88,15 @@ public class NewsScheduler {
             if (newsService.existsByUrl(url)) continue; // 去重
 
             String title = item.has("title") ? item.get("title").asText() : "";
-            if (title.isEmpty()) title = "快讯";
-
             String text = item.has("content_text") ? item.get("content_text").asText("") : "";
             text = HTML_TAG.matcher(text).replaceAll("").trim();
             if (text.length() > 500) text = text.substring(0, 500);
+
+            // 无标题时取正文前 30 字，避免全部显示"快讯"
+            if (title.isEmpty()) {
+                title = text.length() > 30 ? text.substring(0, 30) + "…" : text;
+                if (title.isEmpty()) title = "快讯";
+            }
 
             long displayTime = item.get("display_time").asLong();
             LocalDateTime publishedAt = LocalDateTime.ofInstant(

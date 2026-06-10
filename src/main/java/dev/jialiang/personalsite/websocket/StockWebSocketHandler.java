@@ -46,7 +46,15 @@ public class StockWebSocketHandler extends TextWebSocketHandler {
     }
 
     private void pushStockData(WebSocketSession session) throws Exception {
-        Set<String> keys = redisTemplate.keys("stock:realtime:*");
+        // 使用 SCAN 替代 KEYS，避免阻塞 Redis
+        Set<String> keys = redisTemplate.execute((org.springframework.data.redis.connection.RedisConnection connection) -> {
+            Set<String> result = new java.util.HashSet<>();
+            var cursor = connection.keyCommands()
+                    .scan(org.springframework.data.redis.core.ScanOptions.scanOptions()
+                            .match("stock:realtime:*").count(50).build());
+            cursor.forEachRemaining(key -> result.add(new String(key)));
+            return result;
+        });
         if (keys == null || keys.isEmpty()) {
             return;
         }

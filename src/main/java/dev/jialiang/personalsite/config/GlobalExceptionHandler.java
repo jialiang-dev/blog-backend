@@ -14,13 +14,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public ApiResponse<Void> handleIllegalArgument(IllegalArgumentException e) {
-        return ApiResponse.error(400, e.getMessage());
+        log.warn("参数错误: {}", e.getMessage());
+        return ApiResponse.error(400, "请求参数不合法");
     }
 
     @ExceptionHandler(RuntimeException.class)
     @ResponseStatus(HttpStatus.NOT_FOUND)
     public ApiResponse<Void> handleRuntime(RuntimeException e) {
-        return ApiResponse.error(404, e.getMessage());
+        log.warn("资源不存在: {}", e.getMessage());
+        return ApiResponse.error(404, "资源不存在");
     }
 
     @ExceptionHandler(Exception.class)
